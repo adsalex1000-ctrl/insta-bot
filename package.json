@@ -1,0 +1,10 @@
+{
+  "name": "instagram-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "playwright": "^1.40.0",
+    "axios": "^1.6.0",
+    "express": "^4.18.2"
+  }
+}
