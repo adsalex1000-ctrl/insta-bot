@@ -9,8 +9,10 @@ app.post('/interagir', async (req, res) => {
     const { tema, webhook_n8n } = req.body;
     res.json({ status: 'Iniciado', mensagem: `Buscando sobre ${tema}` });
 
+    // ATENÇÃO: Deixe headless: false APENAS na primeira vez para fazer o login. 
+    // Depois que estiver logado e a sessão salva, altere para headless: true.
     const browser = await chromium.launchPersistentContext('/app/sessao-insta', {
-        headless: true,
+        headless: false, 
         args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
     });
 
