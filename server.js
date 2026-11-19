@@ -7,7 +7,8 @@ const app = express();
 app.use(express.json());
 
 const PASTA_SESSAO = '/app/sessao-insta';
-const ARQUIVO_COOKIES = `${PASTA_SESSAO}/state.json`;
+const ARQUIVO_COOKIES = '/app/state.json';
+const ARQUIVO_PRINT = '/tmp/erro.png';
 let ocupado = false;
 
 process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e));
@@ -16,6 +17,14 @@ process.on('uncaughtException', (e) => console.error('uncaughtException:', e));
 const aleatorio = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
 const limparTema = (t = '') =>
   t.normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+
+async function avisarN8n(webhook, dados) {
+  try {
+    await axios.post(webhook, dados, { timeout: 30000 });
+  } catch (e) {
+    console.error('Falha ao avisar o n8n:', e.message);
+  }
+}
 
 app.post('/interagir', async (req, res) => {
   const { tema, webhook_n8n } = req.body || {};
@@ -30,15 +39,17 @@ app.post('/interagir', async (req, res) => {
 
   let browser, page;
   try {
+    if (!fs.existsSync(ARQUIVO_COOKIES)) {
+      throw new Error('Arquivo /app/state.json não encontrado (crie a Montagem de Arquivo no EasyPanel)');
+    }
+    const estado = JSON.parse(fs.readFileSync(ARQUIVO_COOKIES, 'utf8'));
+
     browser = await chromium.launchPersistentContext(PASTA_SESSAO, {
       headless: true,
+      locale: 'pt-BR',
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
     });
-
-    if (fs.existsSync(ARQUIVO_COOKIES)) {
-      const estado = JSON.parse(fs.readFileSync(ARQUIVO_COOKIES, 'utf8'));
-      await browser.addCookies(estado.cookies);
-    }
+    await browser.addCookies(estado.cookies || []);
 
     page = await browser.newPage();
     const hashtag = limparTema(tema);
@@ -47,16 +58,19 @@ app.post('/interagir', async (req, res) => {
     await page.goto(`https://www.instagram.com/explore/tags/${hashtag}/`, { waitUntil: 'domcontentloaded' });
     await page.waitForTimeout(aleatorio(4000, 6000));
 
-    console.log('URL atual:', page.url());
+    const urlAtual = page.url();
+    console.log('URL atual:', urlAtual);
     console.log('Título:', await page.title());
-    const pedeLogin = (await page.locator('input[name="username"]').count()) > 0;
-    if (pedeLogin) throw new Error('Instagram pedindo login');
 
-    if (page.url().includes('/accounts/login')) {
-      throw new Error('Sessão do Instagram não está logada');
-    }
+    const pedeLogin =
+      urlAtual.includes('/accounts/login') ||
+      urlAtual.includes('/popular/') ||
+      (await page.locator('input[name="username"]').count()) > 0;
+    if (pedeLogin) throw new Error('Sessão do Instagram não está logada (refaça o state.json)');
 
-    await page.locator('article img').first().click();
+    const primeiroPost = page.locator('a[href*="/p/"], a[href*="/reel/"]').first();
+    await primeiroPost.waitFor({ timeout: 20000 });
+    await primeiroPost.click();
     await page.waitForTimeout(aleatorio(3000, 5000));
 
     let legenda = 'Post interessante sobre o tema.';
@@ -73,7 +87,7 @@ app.post('/interagir', async (req, res) => {
     if (await btnCurtir.isVisible()) await btnCurtir.click();
 
     const caixaTexto = page
-      .locator('textarea[placeholder*="Comentar"], textarea[placeholder*="Add a comment"]')
+      .locator('textarea[placeholder*="omentar"], textarea[placeholder*="Add a comment"]')
       .first();
     await caixaTexto.click();
     await caixaTexto.fill(comentario);
@@ -83,14 +97,18 @@ app.post('/interagir', async (req, res) => {
     console.log('Interação finalizada!');
     await page.waitForTimeout(4000);
   } catch (err) {
-    try { await page.screenshot({ path: '/tmp/erro.png' }); } catch (e) {}
     console.error('Erro no robô:', err);
+    try { await page.screenshot({ path: ARQUIVO_PRINT }); } catch (e) {}
+    await avisarN8n(webhook_n8n, { erro: err.message, tema });
   } finally {
     if (browser) await browser.close();
     ocupado = false;
   }
 });
 
-app.get('/erro.png', (req, res) => res.sendFile('/tmp/erro.png'));
+app.get('/erro.png', (req, res) => {
+  if (!fs.existsSync(ARQUIVO_PRINT)) return res.status(404).send('Sem print ainda');
+  res.sendFile(ARQUIVO_PRINT);
+});
 
 app.listen(3000, () => console.log('Robô Playwright rodando na porta 3000'));
