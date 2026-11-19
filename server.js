@@ -9,21 +9,119 @@ app.use(express.json());
 const PASTA_SESSAO = '/app/sessao-insta';
 const ARQUIVO_COOKIES = '/app/state.json';
 const ARQUIVO_PRINT = '/tmp/erro.png';
+
+// ===== AJUSTES (mude aqui) =====
+const ESPERA_VIDEO_MIN = 15;   // segundos assistindo (mínimo)
+const ESPERA_VIDEO_MAX = 40;   // segundos assistindo (máximo)
+const SESSAO_MIN = 10;         // minutos da sessão (mínimo)
+const SESSAO_MAX = 15;         // minutos da sessão (máximo)
+const CHANCE_COMENTAR = 0.4;   // 0.4 = comenta em 40% dos vídeos
+const QTD_COMENTARIOS_IA = 3;  // quantos comentários vão para a IA escolher
+// ================================
+
 let ocupado = false;
+const jaVistos = new Set();
 
 process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e));
 process.on('uncaughtException', (e) => console.error('uncaughtException:', e));
 
 const aleatorio = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+const embaralhar = (arr) => [...arr].sort(() => Math.random() - 0.5);
 const limparTema = (t = '') =>
   t.normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
 
-async function avisarN8n(webhook, dados) {
-  try {
-    await axios.post(webhook, dados, { timeout: 30000 });
-  } catch (e) {
-    console.error('Falha ao avisar o n8n:', e.message);
+async function tirarPrint(page) {
+  try { await page.screenshot({ path: ARQUIVO_PRINT }); } catch (e) {}
+}
+
+async function coletarLinks(page) {
+  const links = new Set();
+  for (let i = 0; i < 4; i++) {
+    const hrefs = await page.$$eval('a[href*="/p/"], a[href*="/reel/"]', (as) => as.map((a) => a.href));
+    hrefs.forEach((h) => links.add(h.split('?')[0]));
+    await page.mouse.wheel(0, 1500);
+    await page.waitForTimeout(aleatorio(1500, 2500));
   }
+  return [...links];
+}
+
+async function lerComentarios(page) {
+  const textos = await page.evaluate(() => {
+    const raiz = document.querySelector('article') || document.body;
+    const vistos = new Set();
+    const lista = [];
+    raiz.querySelectorAll('span[dir="auto"]').forEach((el) => {
+      const t = (el.innerText || '').trim();
+      if (t.length >= 12 && t.length <= 300 && !vistos.has(t)) {
+        vistos.add(t);
+        lista.push(t);
+      }
+    });
+    return lista;
+  });
+  return textos.slice(1, 21); // o primeiro texto costuma ser a legenda
+}
+
+async function processarVideo(page, url, tema, webhook) {
+  await page.goto(url, { waitUntil: 'domcontentloaded' });
+  await page.waitForTimeout(aleatorio(3000, 5000));
+
+  // 1. assistir por um tempo sorteado
+  const espera = aleatorio(ESPERA_VIDEO_MIN, ESPERA_VIDEO_MAX);
+  console.log(`Assistindo ${espera}s: ${url}`);
+  await page.waitForTimeout(espera * 1000);
+
+  // 2. curtir
+  const btnCurtir = page.locator('svg[aria-label="Curtir"], svg[aria-label="Like"]').first();
+  if (await btnCurtir.isVisible().catch(() => false)) {
+    await btnCurtir.click();
+    await page.waitForTimeout(aleatorio(1000, 2500));
+  }
+
+  // 3. salvar o vídeo
+  const btnSalvar = page.locator('svg[aria-label="Salvar"], svg[aria-label="Save"]').first();
+  if (await btnSalvar.isVisible().catch(() => false)) {
+    await btnSalvar.click();
+    console.log('Vídeo salvo');
+    await page.waitForTimeout(aleatorio(1000, 2500));
+  }
+
+  // 4. comentar só em parte dos vídeos
+  if (Math.random() > CHANCE_COMENTAR) {
+    console.log('Sem comentário neste vídeo');
+    return;
+  }
+
+  const comentarios = await lerComentarios(page);
+  console.log(`Comentários lidos: ${comentarios.length}`);
+  if (comentarios.length < QTD_COMENTARIOS_IA) {
+    console.log('Poucos comentários, pulando');
+    return;
+  }
+
+  const escolhidos = embaralhar(comentarios).slice(0, QTD_COMENTARIOS_IA);
+  const resposta = await axios.post(webhook, { tema, comentarios: escolhidos }, { timeout: 90000 });
+  const comentario = String(resposta.data?.comentario || '').trim().slice(0, 220);
+  if (!comentario) {
+    console.log('IA não devolveu comentário');
+    return;
+  }
+
+  const seletorCaixa =
+    'textarea[aria-label*="omentário"], textarea[placeholder*="omentário"], textarea[aria-label*="omment"], textarea[placeholder*="omment"]';
+  let caixa = page.locator(seletorCaixa).first();
+  if (!(await caixa.isVisible().catch(() => false))) {
+    // em alguns vídeos a caixa só aparece depois de clicar no ícone de comentar
+    await page.locator('svg[aria-label="Comentar"], svg[aria-label="Comment"]').first().click().catch(() => {});
+    await page.waitForTimeout(1500);
+    caixa = page.locator(seletorCaixa).first();
+  }
+  await caixa.click({ timeout: 10000 });
+  await caixa.pressSequentially(comentario, { delay: aleatorio(60, 140) });
+  await page.waitForTimeout(aleatorio(1500, 3000));
+  await caixa.press('Enter');
+  console.log('Comentou:', comentario);
+  await page.waitForTimeout(aleatorio(3000, 6000));
 }
 
 app.post('/interagir', async (req, res) => {
@@ -32,15 +130,16 @@ app.post('/interagir', async (req, res) => {
     return res.status(400).json({ status: 'Erro', mensagem: 'Envie tema e webhook_n8n' });
   }
   if (ocupado) {
-    return res.status(429).json({ status: 'Ocupado', mensagem: 'Já existe uma execução em andamento' });
+    return res.status(429).json({ status: 'Ocupado', mensagem: 'Já existe uma sessão em andamento' });
   }
   ocupado = true;
-  res.json({ status: 'Iniciado', mensagem: `Buscando sobre ${tema}` });
+  const duracaoMin = aleatorio(SESSAO_MIN, SESSAO_MAX);
+  res.json({ status: 'Iniciado', mensagem: `Sessão de ${duracaoMin} min sobre ${tema}` });
 
   let browser, page;
   try {
     if (!fs.existsSync(ARQUIVO_COOKIES)) {
-      throw new Error('Arquivo /app/state.json não encontrado (crie a Montagem de Arquivo no EasyPanel)');
+      throw new Error('Arquivo /app/state.json não encontrado (Montagem de Arquivo no EasyPanel)');
     }
     const estado = JSON.parse(fs.readFileSync(ARQUIVO_COOKIES, 'utf8'));
 
@@ -53,53 +152,43 @@ app.post('/interagir', async (req, res) => {
 
     page = await browser.newPage();
     const hashtag = limparTema(tema);
-    console.log(`Iniciando busca por: ${hashtag}`);
+    console.log(`Sessão de ${duracaoMin} min. Tema: ${hashtag}`);
 
     await page.goto(`https://www.instagram.com/explore/tags/${hashtag}/`, { waitUntil: 'domcontentloaded' });
     await page.waitForTimeout(aleatorio(4000, 6000));
 
     const urlAtual = page.url();
     console.log('URL atual:', urlAtual);
-    console.log('Título:', await page.title());
-
     const pedeLogin =
       urlAtual.includes('/accounts/login') ||
       urlAtual.includes('/popular/') ||
       (await page.locator('input[name="username"]').count()) > 0;
     if (pedeLogin) throw new Error('Sessão do Instagram não está logada (refaça o state.json)');
 
-    const primeiroPost = page.locator('a[href*="/p/"], a[href*="/reel/"]').first();
-    await primeiroPost.waitFor({ timeout: 20000 });
-    await primeiroPost.click();
-    await page.waitForTimeout(aleatorio(3000, 5000));
+    const links = (await coletarLinks(page)).filter((l) => !jaVistos.has(l));
+    console.log(`${links.length} posts encontrados`);
 
-    let legenda = 'Post interessante sobre o tema.';
-    try {
-      legenda = (await page.locator('h1').first().textContent({ timeout: 5000 })) || legenda;
-    } catch (e) {}
+    const fim = Date.now() + duracaoMin * 60 * 1000;
+    let errosSeguidos = 0;
 
-    const resposta = await axios.post(webhook_n8n, { legenda, tema }, { timeout: 90000 });
-    const comentario = resposta.data?.comentario || 'Muito bom!';
-
-    await page.waitForTimeout(aleatorio(12000, 18000)); // "assistindo"
-
-    const btnCurtir = page.locator('svg[aria-label="Curtir"], svg[aria-label="Like"]').first();
-    if (await btnCurtir.isVisible()) await btnCurtir.click();
-
-    const caixaTexto = page
-      .locator('textarea[placeholder*="omentar"], textarea[placeholder*="Add a comment"]')
-      .first();
-    await caixaTexto.click();
-    await caixaTexto.fill(comentario);
-    await page.waitForTimeout(aleatorio(1500, 3000));
-    await caixaTexto.press('Enter');
-
-    console.log('Interação finalizada!');
-    await page.waitForTimeout(4000);
+    for (const link of links) {
+      if (Date.now() >= fim) break;
+      jaVistos.add(link);
+      try {
+        await processarVideo(page, link, tema, webhook_n8n);
+        errosSeguidos = 0;
+      } catch (e) {
+        errosSeguidos++;
+        console.error('Erro neste vídeo:', e.message);
+        await tirarPrint(page);
+        if (errosSeguidos >= 3) throw new Error('3 erros seguidos, encerrando a sessão');
+      }
+      await page.waitForTimeout(aleatorio(2000, 6000));
+    }
+    console.log('Sessão finalizada!');
   } catch (err) {
     console.error('Erro no robô:', err);
-    try { await page.screenshot({ path: ARQUIVO_PRINT }); } catch (e) {}
-    await avisarN8n(webhook_n8n, { erro: err.message, tema });
+    await tirarPrint(page);
   } finally {
     if (browser) await browser.close();
     ocupado = false;
