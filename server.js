@@ -28,7 +28,7 @@ app.post('/interagir', async (req, res) => {
   ocupado = true;
   res.json({ status: 'Iniciado', mensagem: `Buscando sobre ${tema}` });
 
-  let browser;
+  let browser, page;
   try {
     browser = await chromium.launchPersistentContext(PASTA_SESSAO, {
       headless: true,
@@ -40,12 +40,17 @@ app.post('/interagir', async (req, res) => {
       await browser.addCookies(estado.cookies);
     }
 
-    const page = await browser.newPage();
+    page = await browser.newPage();
     const hashtag = limparTema(tema);
     console.log(`Iniciando busca por: ${hashtag}`);
 
     await page.goto(`https://www.instagram.com/explore/tags/${hashtag}/`, { waitUntil: 'domcontentloaded' });
     await page.waitForTimeout(aleatorio(4000, 6000));
+
+    console.log('URL atual:', page.url());
+    console.log('Título:', await page.title());
+    const pedeLogin = (await page.locator('input[name="username"]').count()) > 0;
+    if (pedeLogin) throw new Error('Instagram pedindo login');
 
     if (page.url().includes('/accounts/login')) {
       throw new Error('Sessão do Instagram não está logada');
@@ -78,11 +83,14 @@ app.post('/interagir', async (req, res) => {
     console.log('Interação finalizada!');
     await page.waitForTimeout(4000);
   } catch (err) {
+    try { await page.screenshot({ path: '/tmp/erro.png' }); } catch (e) {}
     console.error('Erro no robô:', err);
   } finally {
     if (browser) await browser.close();
     ocupado = false;
   }
 });
+
+app.get('/erro.png', (req, res) => res.sendFile('/tmp/erro.png'));
 
 app.listen(3000, () => console.log('Robô Playwright rodando na porta 3000'));
