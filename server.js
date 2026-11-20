@@ -16,7 +16,7 @@ const ESPERA_VIDEO_MAX = 40;   // segundos assistindo (máximo)
 const SESSAO_MIN = 10;         // minutos da sessão (mínimo)
 const SESSAO_MAX = 15;         // minutos da sessão (máximo)
 const CHANCE_COMENTAR = 0.4;   // 0.4 = comenta em 40% dos vídeos
-const QTD_COMENTARIOS_IA = 3;  // quantos comentários vão para a IA escolher
+const QTD_COMENTARIOS_IA = 3;  // quantos comentários vão para a IA como referência
 // ================================
 
 let ocupado = false;
@@ -45,21 +45,24 @@ async function coletarLinks(page) {
   return [...links];
 }
 
-async function lerComentarios(page) {
+// Lê a legenda (primeiro texto da página) e até 20 comentários (os textos seguintes)
+async function lerPost(page) {
   const textos = await page.evaluate(() => {
     const raiz = document.querySelector('article') || document.body;
     const vistos = new Set();
     const lista = [];
     raiz.querySelectorAll('span[dir="auto"]').forEach((el) => {
       const t = (el.innerText || '').trim();
-      if (t.length >= 12 && t.length <= 300 && !vistos.has(t)) {
+      if (t.length >= 12 && t.length <= 600 && !vistos.has(t)) {
         vistos.add(t);
         lista.push(t);
       }
     });
     return lista;
   });
-  return textos.slice(1, 21); // o primeiro texto costuma ser a legenda
+  const legenda = (textos[0] || '').slice(0, 500);
+  const comentarios = textos.slice(1, 21).filter((t) => t.length <= 300);
+  return { legenda, comentarios };
 }
 
 async function processarVideo(page, url, tema, webhook) {
@@ -92,15 +95,16 @@ async function processarVideo(page, url, tema, webhook) {
     return;
   }
 
-  const comentarios = await lerComentarios(page);
+  const { legenda, comentarios } = await lerPost(page);
+  console.log(`Legenda lida: ${legenda ? legenda.slice(0, 80) : '(nenhuma)'}`);
   console.log(`Comentários lidos: ${comentarios.length}`);
-  if (comentarios.length < QTD_COMENTARIOS_IA) {
-    console.log('Poucos comentários, pulando');
+  if (!legenda && comentarios.length === 0) {
+    console.log('Nada para a IA ler, pulando');
     return;
   }
 
   const escolhidos = embaralhar(comentarios).slice(0, QTD_COMENTARIOS_IA);
-  const resposta = await axios.post(webhook, { tema, comentarios: escolhidos }, { timeout: 90000 });
+  const resposta = await axios.post(webhook, { tema, legenda, comentarios: escolhidos }, { timeout: 90000 });
   const comentario = String(resposta.data?.comentario || '').trim().slice(0, 220);
   if (!comentario) {
     console.log('IA não devolveu comentário');
