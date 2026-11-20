@@ -11,12 +11,14 @@ const ARQUIVO_COOKIES = '/app/state.json';
 const ARQUIVO_PRINT = '/tmp/erro.png';
 
 // ===== AJUSTES (mude aqui) =====
-const ESPERA_VIDEO_MIN = 15;   // segundos assistindo (mínimo)
-const ESPERA_VIDEO_MAX = 40;   // segundos assistindo (máximo)
-const SESSAO_MIN = 10;         // minutos da sessão (mínimo)
-const SESSAO_MAX = 15;         // minutos da sessão (máximo)
-const CHANCE_COMENTAR = 0.4;   // 0.4 = comenta em 40% dos vídeos
-const QTD_COMENTARIOS_IA = 3;  // quantos comentários vão para a IA como referência
+const SESSAO_MIN = 10;          // minutos da sessão (mínimo)
+const SESSAO_MAX = 15;          // minutos da sessão (máximo)
+const CHANCE_INTERAGIR = 0.5;   // 0.5 = em 50% dos posts ele assiste inteiro, curte e salva
+const CHANCE_COMENTAR = 0.5;    // entre os que ele interage, chance de comentar (0.5 = metade)
+const ESPERA_VIDEO_MIN = 15;    // segundos nos vídeos só assistidos (mínimo)
+const ESPERA_VIDEO_MAX = 40;    // segundos nos vídeos só assistidos (máximo)
+const VIDEO_INTEIRO_MAX = 120;  // limite (segundos) para assistir um vídeo inteiro
+const QTD_COMENTARIOS_IA = 3;   // quantos comentários vão para a IA como referência
 // ================================
 
 let ocupado = false;
@@ -45,6 +47,49 @@ async function coletarLinks(page) {
   return [...links];
 }
 
+// Simula o dedo humano: mexe o mouse, rola aos poucos, às vezes volta, e para para "ler"
+async function rolarComoHumano(page, ms) {
+  const fim = Date.now() + ms;
+  const vp = page.viewportSize() || { width: 1280, height: 720 };
+  await page.mouse.move(
+    aleatorio(200, Math.max(300, vp.width - 200)),
+    aleatorio(150, Math.max(250, vp.height - 150)),
+    { steps: aleatorio(8, 20) }
+  );
+  while (Date.now() < fim) {
+    const passos = aleatorio(3, 7);
+    const direcao = Math.random() < 0.8 ? 1 : -1; // quase sempre para baixo, às vezes volta
+    for (let i = 0; i < passos; i++) {
+      await page.mouse.wheel(0, direcao * aleatorio(40, 120));
+      await page.waitForTimeout(aleatorio(30, 90));
+    }
+    const pausa = Math.min(aleatorio(1500, 5000), Math.max(300, fim - Date.now()));
+    await page.waitForTimeout(pausa);
+  }
+}
+
+// Assiste o vídeo até o fim (usa a duração real do vídeo, com limite de segurança)
+async function assistirInteiro(page) {
+  const info = await page.evaluate(() => {
+    const v = document.querySelector('video');
+    if (!v) return null;
+    if (v.paused) v.play().catch(() => {});
+    return { duracao: v.duration, atual: v.currentTime };
+  });
+
+  if (!info) {
+    const s = aleatorio(6, 12);
+    console.log(`Post sem vídeo (foto), olhando ${s}s`);
+    await rolarComoHumano(page, s * 1000);
+    return;
+  }
+
+  let restante = Number.isFinite(info.duracao) ? info.duracao - info.atual : aleatorio(25, 40);
+  restante = Math.min(Math.max(restante, 5), VIDEO_INTEIRO_MAX) + aleatorio(1, 3);
+  console.log(`Assistindo o vídeo inteiro: ${Math.round(restante)}s`);
+  await page.waitForTimeout(restante * 1000);
+}
+
 // Lê a legenda (primeiro texto da página) e até 20 comentários (os textos seguintes)
 async function lerPost(page) {
   const textos = await page.evaluate(() => {
@@ -69,19 +114,27 @@ async function processarVideo(page, url, tema, webhook) {
   await page.goto(url, { waitUntil: 'domcontentloaded' });
   await page.waitForTimeout(aleatorio(3000, 5000));
 
-  // 1. assistir por um tempo sorteado
-  const espera = aleatorio(ESPERA_VIDEO_MIN, ESPERA_VIDEO_MAX);
-  console.log(`Assistindo ${espera}s: ${url}`);
-  await page.waitForTimeout(espera * 1000);
+  const interagir = Math.random() < CHANCE_INTERAGIR;
 
-  // 2. curtir
+  // ---- Tipo 1: só assiste um tempo sorteado, rolando a tela, sem interagir ----
+  if (!interagir) {
+    const espera = aleatorio(ESPERA_VIDEO_MIN, ESPERA_VIDEO_MAX);
+    console.log(`Só assistindo ${espera}s (sem interagir): ${url}`);
+    await rolarComoHumano(page, espera * 1000);
+    return;
+  }
+
+  // ---- Tipo 2: assiste inteiro, curte, salva e (às vezes) comenta ----
+  console.log(`Vídeo para interagir: ${url}`);
+  await assistirInteiro(page);
+
   const btnCurtir = page.locator('svg[aria-label="Curtir"], svg[aria-label="Like"]').first();
   if (await btnCurtir.isVisible().catch(() => false)) {
     await btnCurtir.click();
+    console.log('Curtiu');
     await page.waitForTimeout(aleatorio(1000, 2500));
   }
 
-  // 3. salvar o vídeo
   const btnSalvar = page.locator('svg[aria-label="Salvar"], svg[aria-label="Save"]').first();
   if (await btnSalvar.isVisible().catch(() => false)) {
     await btnSalvar.click();
@@ -89,11 +142,13 @@ async function processarVideo(page, url, tema, webhook) {
     await page.waitForTimeout(aleatorio(1000, 2500));
   }
 
-  // 4. comentar só em parte dos vídeos
   if (Math.random() > CHANCE_COMENTAR) {
-    console.log('Sem comentário neste vídeo');
+    console.log('Curtiu e salvou, sem comentário neste vídeo');
     return;
   }
+
+  // rola os comentários como quem lê (e carrega mais comentários)
+  await rolarComoHumano(page, aleatorio(3000, 6000));
 
   const { legenda, comentarios } = await lerPost(page);
   console.log(`Legenda lida: ${legenda ? legenda.slice(0, 80) : '(nenhuma)'}`);
